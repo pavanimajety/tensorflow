@@ -72,7 +72,11 @@ Status ConvertStridedSliceHelper(
     size_dims.d[i] = (std::abs(end_dims->dim(i) - begin_dims->dim(i)) +
                       std::abs(stride_dims->dim(i)) - 1) /
                      std::abs(stride_dims->dim(i));
-
+    // When begin tensor has unknown values, currently size can't be computed.
+    if(begin_dims->dim(i) < 0) {
+      return errors::Unimplemented(
+             "Dynamic values in begin weight tensor are unsupported");
+    }
     if (input_dims.dim_size(i) < 0) {
       // end_dims and begin_dims do not have valid information yet.
       dynamic_input_size_indices.push_back(i);
@@ -130,11 +134,31 @@ Status ConvertStridedSliceHelper(
                                   op_instance);
   ITensorProxyPtr tensor = (*slice)->getOutput(0);
 
-  // Reshape for shrink_axis.
+  // Reshape for shrink axis, ellipsis masks based on the shape computed by
+  // ValidateStridedSliceOp or HandleDynamicStridedSliceInput.
+  nvinfer1::Dims dims = tensor->trt_tensor()->getDimensions();
+  std::vector<int> slice_input_dims(dims.d, dims.d + dims.nbDims);
+  StridedSliceShapeSpec empty_spec;
+  empty_spec.shrink_axis_dense_mask = 0;
+  auto shrink_axis_mask = strided_slice_spec.value_or(empty_spec).shrink_axis_dense_mask;
   if (final_shape) {
-    TF_RETURN_IF_ERROR(PrepareTensorForShape(
-        params->converter, TRT_TensorOrWeights(tensor), *final_shape,
-        /*validation_only=*/false, &tensor, node_def, op_instance));
+    int shrink_idx = params->use_implicit_batch ? 1 : 0;
+    if(shrink_axis_mask)  {
+      const auto bShrink_axis_mask = std::bitset<32>(shrink_axis_mask);
+      for(int idx = 0; idx < slice_input_dims.size(); ++idx, ++shrink_idx) {
+        const bool shrink_axis = bShrink_axis_mask[shrink_idx];
+        if(shrink_axis){
+          slice_input_dims[idx] = 0;
+        }
+      }
+      TF_RETURN_IF_ERROR(params->converter->SqueezeTensor(tensor,&slice_input_dims,
+                      params, &tensor, op_instance));
+   }
+   else {
+        TF_RETURN_IF_ERROR(PrepareTensorForShape(
+                params->converter, TRT_TensorOrWeights(tensor), *final_shape,
+                /*validation_only=*/false, &tensor, node_def, op_instance));
+   }
   }
   params->outputs->push_back(TRT_TensorOrWeights(tensor));
   return OkStatus();
@@ -152,6 +176,36 @@ Status HandleDynamicStridedSliceInput(
   nvinfer1::ITensor* input_tensor = slice_layer->getInput(0);
   TRT_ENSURE(input_tensor);
 
+  // When begin_mask or end_mask are set, we have to disregard the begin_tensor
+  // and end_tensor values. In static indices cases, ValidateStridedSliceOp
+  // returns the correct begin_tensor and end_tensor values, howe with dynamic
+  // indices the correct shape has to be computed.
+
+  VLOG(2) << "begin_dims before: " <<  DebugString(begin_dims);
+  VLOG(2) << "end_dims before: " <<  DebugString(end_dims);
+  const auto begin_mask = std::bitset<32>(strided_slice_spec.begin_dense_mask);
+  const auto end_mask = std::bitset<32>(strided_slice_spec.end_dense_mask);
+  const auto shrink_axis_mask = std::bitset<32>(strided_slice_spec.shrink_axis_dense_mask);
+  nvinfer1::Dims dims = input_tensor->getDimensions();
+
+  for (int idx = 0; idx < dims.nbDims; ++idx){
+    // VLOG(2) << "begin_mask[" << idx << "]: "<< begin_mask[idx];
+    // VLOG(2) << "end_mask[" << idx << "]: "<< end_mask[idx];
+    // VLOG(2) << "shrink_mask[" << idx << "]: "<< shrink_axis_mask[idx];
+    if (begin_mask[idx]) {
+      begin_dims.d[idx] = 0;
+    }
+    if (end_mask[idx]){
+      end_dims.d[idx] = dims.d[idx];
+    }
+    if(shrink_axis_mask[idx]){
+       end_dims.d[idx] = begin_dims.d[idx] + 1;
+    }
+  }
+
+  VLOG(2) << "begin_dims after shrink_axis_mask correction: " <<  DebugString(begin_dims);
+  VLOG(2) << "end_dims after shrink_axis_mask correction: " <<  DebugString(end_dims);
+
   // For each dynamic input dimension of the input, do some preprocessing based
   // on whether this dimension is set in "begin_mask" or "end_mask" and the sign
   // of the dimension's stride value.
@@ -167,8 +221,7 @@ Status HandleDynamicStridedSliceInput(
   //     dynamic size of dimension "dynamic_idx".
   absl::InlinedVector<int64, 4> dynamic_begin_indices;
   absl::InlinedVector<int64, 4> dynamic_end_indices;
-  const auto begin_mask = std::bitset<32>(strided_slice_spec.begin_dense_mask);
-  const auto end_mask = std::bitset<32>(strided_slice_spec.end_dense_mask);
+
   for (int i = 0; i < dynamic_input_size_indices.size(); i++) {
     auto dynamic_idx = dynamic_input_size_indices[i];
     if (begin_mask[dynamic_idx]) {
@@ -177,7 +230,7 @@ Status HandleDynamicStridedSliceInput(
         dynamic_begin_indices.push_back(dynamic_idx);
       }
     }
-    if (end_mask[dynamic_idx]) {
+    if (end_mask[dynamic_idx] && !shrink_axis_mask[dynamic_idx]) {
       end_dims.d[dynamic_idx] = stride_dims.d[dynamic_idx] > 0 ? 0 : -1;
       if (stride_dims.d[dynamic_idx] > 0) {
         dynamic_end_indices.push_back(dynamic_idx);
@@ -185,8 +238,8 @@ Status HandleDynamicStridedSliceInput(
     }
   }
 
-  // VLOG(2) << " Dynamic begin indices: " << DebugString(dynamic_begin_indices)
-  //         << " Dynamic end indices: " << DebugString(dynamic_end_indices);
+  VLOG(2) << " Dynamic begin indices: " << DebugString(dynamic_begin_indices)
+          << " Dynamic end indices: " << DebugString(dynamic_end_indices);
 
   // Create ITensors for each of the begin/stride/end constants.
   StatusOr<nvinfer1::IConstantLayer*> begin_const = builder->Constant(
