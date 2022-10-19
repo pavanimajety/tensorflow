@@ -4961,6 +4961,159 @@ TEST_P(OpConverter_FP32_Test, ConvertSqueeze) {
   }
 }
 
+TEST_P(OpConverter_FP32_FP16_INT32_Test, ConvertStridedSlice2) {
+  // Get nodedef for StridedSlice layer.
+  auto get_strided_slice_nodedef =
+      [](DataType tf_type, int64 begin_mask = 0, int64 end_mask = 0,
+         int64 ellipsis_mask = 0, int64 new_axis_mask = 0,
+         int64 shrink_axis_mask = 0) -> NodeDef {
+    Scope s = Scope::NewRootScope();
+    auto input = ops::Placeholder(s.WithOpName("input"), tf_type);
+    auto begin = ops::Placeholder(s.WithOpName("begin"), DT_INT32);
+    auto end = ops::Placeholder(s.WithOpName("end"), DT_INT32);
+    auto strides = ops::Placeholder(s.WithOpName("strides"), DT_INT32);
+    ops::StridedSlice::Attrs attrs = ops::StridedSlice::Attrs()
+                                         .BeginMask(begin_mask)
+                                         .EndMask(end_mask)
+                                         .EllipsisMask(ellipsis_mask)
+                                         .NewAxisMask(new_axis_mask)
+                                         .ShrinkAxisMask(shrink_axis_mask);
+    auto strided_slice = ops::StridedSlice(s.WithOpName("my_strided_slice"),
+                                           input, begin, end, strides, attrs);
+    return strided_slice.operation.node()->def();
+  };
+  struct TestParams {
+    std::vector<int> input_dims;
+    std::vector<int> begin;
+    std::vector<int> end;
+    std::vector<int> strides;
+    int begin_mask;
+    int end_mask;
+    int ellipsis_mask;
+    int new_axis_mask;
+    int shrink_axis_mask;
+    std::vector<int> expected_output_dims;
+    std::vector<float> expected_output;
+    Status conversion_status;
+    Status runtime_status;
+    std::vector<int> partial_input_dims;
+  };
+  auto get_mask = [](const std::vector<int>& mask) {
+   int result = 0;
+   for (int i = 0; i < mask.size(); i++) {
+     if (mask[i]) result += (1 << i);
+   }
+   return result;
+ };
+
+ // Same input is used for all tests.
+ const std::vector<float> ok_input = {1, 2, 3, 4, 5, 6,
+                                      7, 8, 9, 10, 11, 12};
+
+ Status modified_batch_dim_status =
+     (trt_mode_ == TrtTestMode::kImplicitBatch)
+         ? errors::Unimplemented(
+               "TensorRT does not allow modifications to "
+               "the batch dimension")
+         : Status::OK();
+   std::vector<TestParams> params = {
+     TestParams{
+           /*input_dims=*/{1, 6, 2},
+           /*begin=*/{0, 0, 0},
+           /*end=*/{0, 0, 3},
+           /*strides=*/{1, 1, 1},
+           /*begin_mask=*/get_mask({ 0,1,1}),
+           /*end_mask=*/get_mask({0,1,1}),
+           /*ellipsis_mask=*/0,
+           /*new_axis_mask=*/0,
+           /*shrink_axis_mask=*/1,
+           /*expected_output_dims=*/{6,2},
+           /*expected_output=*/{1,2,3,4,5,6,7,8,9,10,11,12},
+          /*conversion_status=*/modified_batch_dim_status,
+           Status::OK(),
+           /*partial_input_dims=*/{-1, -1, -1},
+       },
+        TestParams{
+           /*input_dims=*/{2, 3, 2},
+           /*begin=*/{0, 0, 0},
+           /*end=*/{0, 0, 3},
+           /*strides=*/{1, 1, 1},
+           /*begin_mask=*/get_mask({ 0,1,1}),
+           /*end_mask=*/get_mask({0,1,1}),
+           /*ellipsis_mask=*/0,
+           /*new_axis_mask=*/0,
+           /*shrink_axis_mask=*/1,
+           /*expected_output_dims=*/{3,2},
+           /*expected_output=*/{1,2,3,4,5,6},
+          /*conversion_status=*/modified_batch_dim_status,
+           Status::OK(),
+           /*partial_input_dims=*/{-1, -1, 2},
+       },
+       TestParams{
+             /*input_dims=*/{2, 3, 2},
+             /*begin=*/{0, 0, 0},
+             /*end=*/{0, 0, 3},
+             /*strides=*/{1, 1, 1},
+             /*begin_mask=*/get_mask({ 0,1,1}),
+             /*end_mask=*/get_mask({0,1,1}),
+             /*ellipsis_mask=*/0,
+             /*new_axis_mask=*/0,
+             /*shrink_axis_mask=*/3,
+             /*expected_output_dims=*/{2},
+             /*expected_output=*/{1,2},
+            /*conversion_status=*/modified_batch_dim_status,
+             Status::OK(),
+             /*partial_input_dims=*/{-1, -1, 2},
+         },
+ };
+
+ int i = 0;
+ for (auto p : params) {
+   Reset();
+   NodeDef node_def = get_strided_slice_nodedef(
+       tf_type_, p.begin_mask, p.end_mask, p.ellipsis_mask, p.new_axis_mask,
+       p.shrink_axis_mask);
+
+   VLOG(2) << "Preparing test case " << i++ << " with dims "
+           << DebugString(p.input_dims);
+
+   switch (trt_mode_) {
+     case TrtTestMode::kImplicitBatch: {
+       AddTestTensor("input", p.input_dims, ok_input);
+       break;
+     }
+     case TrtTestMode::kExplicitBatch: {
+       AddTestTensor("input", p.input_dims, ok_input);
+       break;
+     }
+     case TrtTestMode::kDynamicShape: {
+       if (p.partial_input_dims.size() > 0) {
+         AddTestTensor("input", p.input_dims, tf_type_, ok_input,
+                       p.partial_input_dims);
+
+       } else {
+         AddTestTensor("input", p.input_dims, tf_type_, ok_input,
+                       p.input_dims);
+       }
+       break;
+     }
+   }
+
+   VLOG(2) << "Adding weights begin: " << DebugString(p.begin)
+           << ", end: " << DebugString(p.end)
+           << ", strides: " << DebugString(p.strides);
+   AddTestWeights<int32>("begin", {static_cast<int>(p.begin.size())}, p.begin);
+   AddTestWeights<int32>("end", {static_cast<int>(p.end.size())}, p.end);
+   AddTestWeights<int32>("strides", {static_cast<int>(p.strides.size())},
+                         p.strides);
+
+   TestOpConverter(node_def, p.expected_output_dims, p.conversion_status,
+                   p.runtime_status, ElementsAreArray(p.expected_output));
+ }
+
+}
+
+
 TEST_P(OpConverter_FP32_FP16_INT32_Test, ConvertStridedSlice) {
   // Get nodedef for StridedSlice layer.
   auto get_strided_slice_nodedef =
