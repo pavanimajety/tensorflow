@@ -76,6 +76,7 @@ Status ConvertStridedSliceHelper(
     if (begin_dims->dim(i) < 0) {
       return errors::Unimplemented(
           "Negative values in begin weight tensor are unsupported");
+
     }
     if (input_dims.dim_size(i) < 0) {
       // end_dims and begin_dims do not have valid information yet.
@@ -175,37 +176,6 @@ Status HandleDynamicStridedSliceInput(
   // returns the correct begin_tensor and end_tensor values, however with
   // dynamic indices the correct shape has to be computed.
 
-  VLOG(3) << "begin_dims before: " << DebugString(begin_dims);
-  VLOG(3) << "end_dims before: " << DebugString(end_dims);
-  const auto begin_mask = std::bitset<32>(strided_slice_spec.begin_dense_mask);
-  const auto end_mask = std::bitset<32>(strided_slice_spec.end_dense_mask);
-  const auto shrink_axis_mask =
-      std::bitset<32>(strided_slice_spec.shrink_axis_dense_mask);
-  nvinfer1::Dims dims = input_tensor->getDimensions();
-
-  for (int idx = 0; idx < dims.nbDims; ++idx) {
-    VLOG(3) << "begin_mask[" << idx << "]: " << begin_mask[idx];
-    VLOG(3) << "end_mask[" << idx << "]: " << end_mask[idx];
-    VLOG(3) << "shrink_mask[" << idx << "]: " << shrink_axis_mask[idx];
-    if (begin_mask[idx]) {
-      begin_dims.d[idx] = 0;
-    }
-    if (end_mask[idx]) {
-      end_dims.d[idx] = dims.d[idx];
-    }
-    if (shrink_axis_mask[idx]) {
-      end_dims.d[idx] = begin_dims.d[idx] + 1;
-    }
-  }
-
-  VLOG(2) << "begin_dims after shrink_axis_mask correction: "
-          << DebugString(begin_dims);
-  VLOG(2) << "end_dims after shrink_axis_mask correction: "
-          << DebugString(end_dims);
-
-  // For each dynamic input dimension of the input, do some preprocessing based
-  // on whether this dimension is set in "begin_mask" or "end_mask" and the sign
-  // of the dimension's stride value.
   // When stride is negative:
   //   - If "begin_mask[dynamic_idx]" is set, then we need to adjust the slice
   //     start of dimension[i] to the dynamic size.
@@ -228,10 +198,8 @@ Status HandleDynamicStridedSliceInput(
       }
     }
     if (end_mask[dynamic_idx] && !shrink_axis_mask[dynamic_idx]) {
-      end_dims.d[dynamic_idx] = stride_dims.d[dynamic_idx] > 0 ? 0 : -1;
       if (stride_dims.d[dynamic_idx] > 0) {
         dynamic_end_indices.push_back(dynamic_idx);
-      }
     }
   }
 
