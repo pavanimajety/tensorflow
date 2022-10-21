@@ -414,10 +414,15 @@ class TRTNetworkBuilder {
 
   // Creates a Gather operation on the shape of the input tensor. The output of
   // the gather operation is a 1D shape tensor where output[i] = (!sub_one ?
-  // input_shape[i] : input_shape[i] -1) if i is in "indices", otherwise zero.
+  // input_shape[i] : input_shape[i] -1) if i is in "indices", otherwise initial
+  // value defined by `init`.
+  // Eg: Input dims = [3,4,2]; indices = [1]; 
+  //     Output: sub_one = false, init = 0: [0, 4, 0]
+  //             sub_one = true, init = 1: [1, 3, 1] 
   StatusOr<nvinfer1::IGatherLayer*> GetPartialShapeOf(
       nvinfer1::ITensor* input, absl::InlinedVector<int64, 4> indices,
-      bool sub_one = false) {
+      /*subtracts one from the full shape wheh true*/bool sub_one = false,
+      /*initializes mask with value init*/int init = 0) {
     TRT_ENSURE(input);
     TRT_ENSURE(indices.size() <= nvinfer1::Dims::MAX_DIMS);
 
@@ -436,7 +441,7 @@ class TRTNetworkBuilder {
     }
 
     // Create a constant tensor containing the gather indices.
-    // For any dim not in "indices", we mark it size to gather a zero.
+    // For any dim not in "indices", we mark it size to the value defined by init.
     const int input_nb_dims = input->getDimensions().nbDims;
     std::vector<int> indices_all(input_nb_dims, input_nb_dims);
     for (auto idx : indices) {
@@ -451,12 +456,12 @@ class TRTNetworkBuilder {
     TRT_ENSURE(gather_indices->getDimensions().nbDims == 1);
     TRT_ENSURE(gather_indices->getType() == nvinfer1::DataType::kINT32);
 
-    // Append a zero to the shape tensor.
-    StatusOr<nvinfer1::IConstantLayer*> zero_result =
-        this->Constant(std::vector<int>{0});
-    TRT_ENSURE_PTR_OK(zero_result);
+    // Append a init to the shape tensor.
+    StatusOr<nvinfer1::IConstantLayer*> init_result =
+        this->Constant(std::vector<int>{init});
+    TRT_ENSURE_PTR_OK(init_result);
     std::array<nvinfer1::ITensor*, 2> cat_inputs = {
-        runtime_shape, (*zero_result)->getOutput(0)};
+        runtime_shape, (*init_result)->getOutput(0)};
     nvinfer1::IConcatenationLayer* cat_layer =
         network_->addConcatenation(cat_inputs.data(), cat_inputs.size());
     TRT_ENSURE(cat_layer);
