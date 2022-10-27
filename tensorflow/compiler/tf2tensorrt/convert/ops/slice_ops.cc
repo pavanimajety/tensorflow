@@ -72,21 +72,13 @@ Status ConvertStridedSliceHelper(
     size_dims.d[i] = (std::abs(end_dims->dim(i) - begin_dims->dim(i)) +
                       std::abs(stride_dims->dim(i)) - 1) /
                      std::abs(stride_dims->dim(i));
-<<<<<<< refs/remotes/origin/master
     // When begin tensor has negative values, currently range can't be computed.
-    if (begin_dims->dim(i) < 0) {
-      return errors::Unimplemented(
-          "Negative values in begin weight tensor are unsupported");
-
+    if(begin_dims->dim(i) < 0) {
+     // return errors::Unimplemented(
+     //         "Negative values in begin weight tensor are unsupported");
+      dynamic_input_size_indices.push_back(i);
     }
-=======
-    // // When begin tensor has negative values, currently range can't be computed.
-    // if(begin_dims->dim(i) < 0) {
-    //   return errors::Unimplemented(
-    //          "Negative values in begin weight tensor are unsupported");
-    // }
->>>>>>> Negative values in begin/end tensors -- preliminary changes.
-    if (input_dims.dim_size(i) < 0) {
+    else if (input_dims.dim_size(i) < 0) {
       // end_dims and begin_dims do not have valid information yet.
       dynamic_input_size_indices.push_back(i);
     } else {
@@ -211,7 +203,7 @@ Status HandleDynamicStridedSliceInput(
 
   for (int i = 0; i < dynamic_input_size_indices.size(); i++) {
     auto dynamic_idx = dynamic_input_size_indices[i];
-    if (begin_dimsd.d[dynamic_idx] > -1 && begin_mask[dynamic_idx]) {
+    if (begin_dims.d[dynamic_idx] > -1 && begin_mask[dynamic_idx]) {
       begin_dims.d[dynamic_idx] = 0;
       if (stride_dims.d[dynamic_idx] < 0) {
         dynamic_begin_indices.push_back(dynamic_idx);
@@ -237,14 +229,14 @@ Status HandleDynamicStridedSliceInput(
 
   for (int i = 0; i < dynamic_input_size_indices.size(); i++) {
     auto idx = dynamic_input_size_indices[i];
-    if (!begin_mask[dynamic_idx] && begin_dims.d[idx] < 0) {
-        negative_begin_indices.push_back(dynamic_idx);
+    if (!begin_mask[idx] && begin_dims.d[idx] < 0) {
+        negative_begin_indices.push_back(idx);
     }
     if (!end_mask[idx] && end_dims.d[idx] < 0) {
-        negative_end_indices.push_back(dynamic_idx);
+        negative_end_indices.push_back(idx);
     }
   }
-  
+
   VLOG(2) << " Negative begin indices: " << DebugString(negative_begin_indices)
           << " Negative end indices: " << DebugString(negative_end_indices);
 
@@ -260,25 +252,70 @@ Status HandleDynamicStridedSliceInput(
       std::vector<int>(end_dims.d, end_dims.d + end_dims.nbDims));
   TRT_ENSURE_PTR_OK(end_const);
   nvinfer1::ITensor* end_tensor = (*end_const)->getOutput(0);
-  // Make the negative indices in begin and end tensors positive
+  std::set<int> neg_beg_set;
+  for(int idx : negative_begin_indices){
+    neg_beg_set.insert(idx);
+  }
+
+  // Make the negative indices in begin and end tensors positive and in range
+  // Eg: shape : [3, 4, 2]
+  //     begin : [-1, 2, 0]  should be transformed to [2, 2, 0]
   if(negative_begin_indices.size() > 0){
+    // return shape-1 tensor
     StatusOr<nvinfer1::IGatherLayer*> negIdx_shape_masked_tensor =
         builder->GetPartialShapeOf(input_tensor, negative_begin_indices,
-                                   /*sub_one=*/false, 
-                                   /*init_value*/1);
-    TRT_ENSURE_PTR_OK(negIdx_shape_masked_tensor);
-    // Perform the modulo math to convert negative index to a positive index.
-    // posIdx = ((negIdx % size) + size) % size
-    // Create a one tensor at masks to
-    StatusOr<nvinfer1::IElementWiseLayer*> neg_modulo = builder->Add(
-        (*negIdx_shape_masked_tensor)->getOutput(0), begin_tensor);
-    TRT_ENSURE_PTR_OK(neg_modulo);
+                                   /*sub_one=*/true);
+    TRT_ENSURE_PTR_OK(negIdx_shape_masked_tensor); // [2, 0, 0] 
+//    // inverse mask
+    std::vector<int> non_neg_begin;
+    for(int idx = 0; idx < begin_dims.nbDims; idx++){
+      if(neg_beg_set.find(idx) != neg_beg_set.end()){
+        // is a negative index, so mask should mark the value 0.
+        non_neg_begin[idx] = 0;
+      }
+      else non_neg_begin[idx] = begin_dims.d[idx];
 
-    // Add back the original "begin" values for static dimensions.
-    StatusOr<nvinfer1::IElementWiseLayer*> begin_corrected = builder->Add(
-        (*dynamic_begin_shape_masked_tensor)->getOutput(0), begin_tensor);
-    TRT_ENSURE_PTR_OK(begin_corrected);
-    begin_tensor = (*begin_corrected)->getOutput(0);
+    }
+    VLOG(2) << "Begin tensor: "<< DebugString(begin_tensor);
+    StatusOr<nvinfer1::IConstantLayer*> nonNegIdx_begin_masked_tensor =
+        builder->Constant(non_neg_begin);        //[0,2,0] 
+    TRT_ENSURE_PTR_OK(nonNegIdx_begin_masked_tensor);
+//
+//    // Add back the original "begin" values for non negative dimensions
+//    // with inverse mask generated values. 
+    StatusOr<nvinfer1::IElementWiseLayer*> begin_intermediate
+         = builder->Add((*negIdx_shape_masked_tensor)->getOutput(0),
+                        (*nonNegIdx_begin_masked_tensor)->getOutput(0)); //[1,2,0]
+    TRT_ENSURE_PTR_OK(begin_intermediate);
+//    //begin_tensor = (*begin_intermediate)->getOutput(0);
+//
+//   // If the begin value at a dimension is less than -1 * input size,
+//   // then the begin value needs to be reset to 0.
+     auto full_runtime_input_shape = builder->Shape(input_tensor);
+     TRT_ENSURE_PTR_OK(full_runtime_input_shape); //[3,4,2]
+    // -1 * shape layer
+    // layer of negative ones
+    auto neg_ones_layer = builder->Constant(std::vector<int>(begin_dims.nbDims,-1));
+    TRT_ENSURE_PTR_OK(neg_ones_layer);//[-1,-1,-1]
+    
+    auto neg_runtime_input_shape = builder->Mul(
+        (*neg_ones_layer)->getOutput(0), (*shape_layer)->getOutput(0)); //[-3, -4, -2]
+    TRT_ENSURE_PTR_OK(neg_runtime_input_shape);
+
+    StatusOr<nvinfer1::IElementWiseLayer*> out_of_range_dims_begin_left_bool =
+        builder->Greater(begin_tensor, (*neg_runtime_input_shape)->getOutput(0));
+    TRT_ENSURE_PTR_OK(out_of_range_dims_begin_left_bool); //[1,1,1]
+    //(*out_of_range_dims_begin_left_bool)->setOutputType(0, nvinfer1::DataType::kINT32); 
+    auto out_of_range_dims_begin_left_int32 = builder->ChangeOutputType(
+                   out_of_range_dims_begin_left_bool,
+                   nvinfer1::DataType::kINT32);
+
+    StatusOr<nvinfer1::IElementWiseLayer*> neg_begin_corrected =
+        builder->Mul((*begin_intermediate)->getOutput(0), (*out_of_range_dims_begin_left_int32)->getOutput(0));
+       //[2, 2, 0] 
+    TRT_ENSURE_PTR_OK(neg_begin_corrected);
+    begin_tensor = (*neg_begin_corrected)->getOutput(0);
+
   }
   // Make corrections based on the begin_mask/end_mask values.
   if (dynamic_end_indices.size() > 0) {
