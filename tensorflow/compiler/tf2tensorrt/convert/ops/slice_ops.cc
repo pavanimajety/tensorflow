@@ -48,6 +48,38 @@ Status HandleDynamicStridedSliceInput(
     nvinfer1::Dims begin_dims, nvinfer1::Dims stride_dims,
     nvinfer1::Dims end_dims);
 
+int ReturnValidBeginIndex(const OpConverterParams * params, const TRT_TernsorOrWeights& input,
+                       const int index,
+                       const vector<int> input_shape){
+  //Check the index is in the valid input range using input shape
+  
+  // Get the shape during runtime.
+
+  // Make a range of values.
+  // begin is valid from -N to N-1 where N is the shape at a specific dimension.
+
+  //check that the index is in the range and clamp if necessary.
+
+
+
+}
+
+int ReturnValidEndIndex(const OpConverterParams * params, const TRT_TernsorOrWeights& input,
+                       const int index,
+                       const vector<int> input_shape){
+  // Check the index is in the valid input range using input shape.
+
+  // Get the shape during runtime.
+
+  // Make a range of values.
+  // end can vary -(N-1) to (N) where N is the shape at a specific dimension
+
+  // Check the index and clamp if necessary.
+  // if end < -(N+1), then end = 0
+  // if end > (N), then end = N
+
+
+}
 Status ConvertStridedSliceHelper(
     const OpConverterParams* params, const TRT_TensorOrWeights& input,
     const PartialTensorShape& input_dims, const SliceDims& begin,
@@ -65,29 +97,34 @@ Status ConvertStridedSliceHelper(
 
   // For each dimension, gather information about static vs dynamic dimension
   // and slice size.
+  nvinfer1::Dims dims_before = input->trt_tensor()->getDimensions();
   nvinfer1::Dims size_dims = begin_dims->AsTrtDims();
   absl::InlinedVector<int64, 4> static_input_size_indices;
-  absl::InlinedVector<int64, 4> dynamic_input_size_indices;
-  for (int i = 0; i < begin_dims->NumDims(); i++) {
-    size_dims.d[i] = (std::abs(end_dims->dim(i) - begin_dims->dim(i)) +
-                      std::abs(stride_dims->dim(i)) - 1) /
-                     std::abs(stride_dims->dim(i));
-    // When begin tensor has negative values, currently range can't be computed.
-    if(begin_dims->dim(i) < 0) {
-     // return errors::Unimplemented(
-     //         "Negative values in begin weight tensor are unsupported");
-      dynamic_input_size_indices.push_back(i);
-    }
-    else if (input_dims.dim_size(i) < 0) {
+  absl::InlinedVector<int64, 4> dynamic_input_size_indices; 
+  absl::InlinedVector<int64, 4> process_begin_indices; 
+  absl::InlinedVector<int64, 4> process_end_indices; 
+
+  for (int idx = 0; idx  < dims_before.nbDims; idx++) {
+    size_dims.d[idx] = (std::abs(end_dims->dim(idx) - begin_dims->dim(idx)) +
+                      std::abs(stride_dims->dim(idx)) - 1) /
+                     std::abs(stride_dims->dim(idx));
+    if (input_dims.dim_size(idx) == -1) {
       // end_dims and begin_dims do not have valid information yet.
-      dynamic_input_size_indices.push_back(i);
+      dynamic_input_size_indices.push_back(idx);
+      // add end_dims for processing when input_dims are unknown 
+      // incase the end_dims are out of range. 
+      process_end_indices.push_back(idx);
     } else {
-      static_input_size_indices.push_back(i);
-      if (end_dims->dim(i) < begin_dims->dim(i) && stride_dims->dim(i) > 0) {
+      static_input_size_indices.push_back(idx);
+      if (end_dims->dim(idx) < begin_dims->dim(idx) && stride_dims->dim(idx) > 0) {
         return errors::InvalidArgument(
             "\"size\" cannot be negative for StridedSlice");
       }
     }
+    //below standard range
+    if(begin_dims->dim(idx) < 0) process_begin_indices.push_back(idx);
+    if(end_dims->dim(idx) < 0) process_end_indices.push_back(idx);
+     
   }
 
   if (!dynamic_input_size_indices.empty()) {
@@ -160,7 +197,7 @@ Status ConvertStridedSliceHelper(
     }
     else {
     /* To do: pmajety:
-          Remove the else condition when shrink_axis_mask is always defined */
+          Remove the else condition when shrink_axis_mask is always defined. */
         TF_RETURN_IF_ERROR(PrepareTensorForShape(
                 params->converter, TRT_TensorOrWeights(tensor), *final_shape,
                 /*validation_only=*/false, &tensor, node_def, op_instance));
@@ -170,7 +207,104 @@ Status ConvertStridedSliceHelper(
   params->outputs->push_back(TRT_TensorOrWeights(tensor));
   return OkStatus();
 }
+Status ProcessOutOfRangeBeginAndEnd(
+    TRTNetworkBuilder* builder, 
+    const StridedSliceShapeSpec& strided_slice_spec,
+    const absl::InlinedVector<int64, 4>& process_begin_indices,
+    const absl::InlinedVector<int64, 4>& process_end_indices,
+    nvinfer1::Dims begin_dims, nvinfer1::Dims stride_dims,
+    nvinfer1::Dims end_dims){
 
+  // Vectors for analyzing negative begin and end endices.
+  absl::InlinedVector<int64, 4> negative_begin_indices;
+  absl::InlinedVector<int64, 4> negative_end_indices;
+
+  VLOG(2) << "begin_dims before: " <<  DebugString(begin_dims);
+  VLOG(2) << "end_dims before: " <<  DebugString(end_dims);
+  const auto begin_mask = std::bitset<32>(strided_slice_spec.begin_dense_mask);
+  const auto end_mask = std::bitset<32>(strided_slice_spec.end_dense_mask);
+  const auto shrink_axis_mask = std::bitset<32>(strided_slice_spec.shrink_axis_dense_mask);
+  nvinfer1::Dims dims = input_tensor->getDimensions();
+
+
+  for (int i = 0; i < process_begin_indices.size(); i++) {
+    auto idx = dynamic_input_size_indices[i];
+    if (!begin_mask[idx] && begin_dims.d[idx] < 0) {
+        negative_begin_indices.push_back(idx);
+    }
+  }
+  for (int i = 0; i < process_end_indices.size(); i++) {
+    if (!end_mask[idx] && end_dims.d[idx] < 0) {
+        negative_end_indices.push_back(idx);
+    }
+  }
+
+  VLOG(2) << " Negative begin indices: " << DebugString(negative_begin_indices)
+          << " Negative end indices: " << DebugString(negative_end_indices);
+  // Make the negative indices in begin and end tensors positive and in range
+  // Eg: shape : [3, 4, 2]
+  //     begin : [-1, 2, 0]  should be transformed to [2, 2, 0]
+  if(negative_begin_indices.size() > 0){
+    // return shape-1 tensor
+    StatusOr<nvinfer1::IGatherLayer*> negIdx_shape_masked_tensor =
+        builder->GetPartialShapeOf(input_tensor, negative_begin_indices,
+                                   /*sub_one=*/true);
+    TRT_ENSURE_PTR_OK(negIdx_shape_masked_tensor); // [2, 0, 0] 
+    // inverse mask
+    std::vector<int> non_neg_begin;
+    for(int idx = 0; idx < begin_dims.nbDims; idx++){
+      if(neg_beg_set.find(idx) != neg_beg_set.end()){
+        // is a negative index, so mask should mark the value 0.
+        non_neg_begin[idx] = 0;
+      }
+      else non_neg_begin[idx] = begin_dims.d[idx];
+
+    }
+    VLOG(2) << "Begin tensor: "<< DebugString(begin_tensor);
+    StatusOr<nvinfer1::IConstantLayer*> nonNegIdx_begin_masked_tensor =
+        builder->Constant(non_neg_begin);        //[0,2,0] 
+    TRT_ENSURE_PTR_OK(nonNegIdx_begin_masked_tensor);
+ 
+     // Add back the original "begin" values for non negative dimensions
+     // with inverse mask generated values. 
+   StatusOr<nvinfer1::IElementWiseLayer*> begin_intermediate
+        = builder->Add((*negIdx_shape_masked_tensor)->getOutput(0),
+                       (*nonNegIdx_begin_masked_tensor)->getOutput(0)); //[1,2,0]
+   TRT_ENSURE_PTR_OK(begin_intermediate);
+     //begin_tensor = (*begin_intermediate)->getOutput(0);
+ 
+    // If the begin value at a dimension is less than -1 * input size,
+    // then the begin value needs to be reset to 0.
+     auto full_runtime_input_shape = builder->Shape(input_tensor);
+     TRT_ENSURE_PTR_OK(full_runtime_input_shape); //[3,4,2]
+    // -1 * shape layer
+    // layer of negative ones
+    auto neg_ones_layer = builder->Constant(std::vector<int>(begin_dims.nbDims,-1));
+    TRT_ENSURE_PTR_OK(neg_ones_layer);//[-1,-1,-1]
+    
+    auto neg_runtime_input_shape = builder->Mul(
+        (*neg_ones_layer)->getOutput(0), (*shape_layer)->getOutput(0)); //[-3, -4, -2]
+    TRT_ENSURE_PTR_OK(neg_runtime_input_shape);
+
+    StatusOr<nvinfer1::IElementWiseLayer*> out_of_range_dims_begin_left_bool =
+        builder->Greater(begin_tensor, (*neg_runtime_input_shape)->getOutput(0));
+    TRT_ENSURE_PTR_OK(out_of_range_dims_begin_left_bool); //[1,1,1]
+    //(*out_of_range_dims_begin_left_bool)->setOutputType(0, nvinfer1::DataType::kINT32); 
+    auto out_of_range_dims_begin_left_int32 = builder->ChangeOutputType(
+                   out_of_range_dims_begin_left_bool,
+                   nvinfer1::DataType::kINT32);
+
+    StatusOr<nvinfer1::IElementWiseLayer*> neg_begin_corrected =
+        builder->Mul((*begin_intermediate)->getOutput(0), (*out_of_range_dims_begin_left_int32)->getOutput(0));
+       //[2, 2, 0] 
+    TRT_ENSURE_PTR_OK(neg_begin_corrected);
+    begin_tensor = (*neg_begin_corrected)->getOutput(0);
+
+    }
+
+
+
+    }
 Status HandleDynamicStridedSliceInput(
     TRTNetworkBuilder* builder, nvinfer1::ISliceLayer* slice_layer,
     const StridedSliceShapeSpec& strided_slice_spec,
@@ -188,6 +322,34 @@ Status HandleDynamicStridedSliceInput(
   // returns the correct begin_tensor and end_tensor values, however with
   // dynamic indices the correct shape has to be computed.
 
+  VLOG(2) << "begin_dims before: " <<  DebugString(begin_dims);
+  VLOG(2) << "end_dims before: " <<  DebugString(end_dims);
+  const auto begin_mask = std::bitset<32>(strided_slice_spec.begin_dense_mask);
+  const auto end_mask = std::bitset<32>(strided_slice_spec.end_dense_mask);
+  const auto shrink_axis_mask = std::bitset<32>(strided_slice_spec.shrink_axis_dense_mask);
+  nvinfer1::Dims dims = input_tensor->getDimensions();
+
+  for (int idx = 0; idx < dims.nbDims; ++idx){
+    // VLOG(2) << "begin_mask[" << idx << "]: "<< begin_mask[idx];
+    // VLOG(2) << "end_mask[" << idx << "]: "<< end_mask[idx];
+    // VLOG(2) << "shrink_mask[" << idx << "]: "<< shrink_axis_mask[idx];
+    if (begin_mask[idx]) {
+      begin_dims.d[idx] = 0;
+    }
+    if (end_mask[idx] && !shrink_axis_mask[idx]){
+      end_dims.d[idx] = dims.d[idx];
+    }
+    if(shrink_axis_mask[idx]){
+       end_dims.d[idx] = begin_dims.d[idx] + 1;
+    }
+  }
+
+  VLOG(2) << "begin_dims after shrink_axis_mask correction: " <<  DebugString(begin_dims);
+  VLOG(2) << "end_dims after shrink_axis_mask correction: " <<  DebugString(end_dims);
+
+  // For each dynamic input dimension of the input, do some preprocessing based
+  // on whether this dimension is set in "begin_mask" or "end_mask" and the sign
+  // of the dimension's stride value.
   // When stride is negative:
   //   - If "begin_mask[dynamic_idx]" is set, then we need to adjust the slice
   //     start of dimension[i] to the dynamic size.
@@ -222,23 +384,6 @@ Status HandleDynamicStridedSliceInput(
 
   VLOG(2) << " Dynamic begin indices: " << DebugString(dynamic_begin_indices)
           << " Dynamic end indices: " << DebugString(dynamic_end_indices);
-
-  // Vectors for analyzing negative begin and end endices.
-  absl::InlinedVector<int64, 4> negative_begin_indices;
-  absl::InlinedVector<int64, 4> negative_end_indices;
-
-  for (int i = 0; i < dynamic_input_size_indices.size(); i++) {
-    auto idx = dynamic_input_size_indices[i];
-    if (!begin_mask[idx] && begin_dims.d[idx] < 0) {
-        negative_begin_indices.push_back(idx);
-    }
-    if (!end_mask[idx] && end_dims.d[idx] < 0) {
-        negative_end_indices.push_back(idx);
-    }
-  }
-
-  VLOG(2) << " Negative begin indices: " << DebugString(negative_begin_indices)
-          << " Negative end indices: " << DebugString(negative_end_indices);
 
   // Create ITensors for each of the begin/stride/end constants.
   StatusOr<nvinfer1::IConstantLayer*> begin_const = builder->Constant(
