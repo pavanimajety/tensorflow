@@ -182,7 +182,6 @@ Status ConvertStridedSliceHelper(
           slice_input_dims[idx] = 0;
         }
       }
-<<<<<<< refs/remotes/origin/master
       TF_RETURN_IF_ERROR(params->converter->SqueezeTensor(
           tensor, &slice_input_dims, params, &tensor, op_instance));
     } else {
@@ -191,17 +190,6 @@ Status ConvertStridedSliceHelper(
       TF_RETURN_IF_ERROR(PrepareTensorForShape(
           params->converter, TRT_TensorOrWeights(tensor), *final_shape,
           /*validation_only=*/false, &tensor, node_def, op_instance));
-=======
-      TF_RETURN_IF_ERROR(params->converter->SqueezeTensor(tensor,&slice_input_dims,
-                      params, &tensor, op_instance));
-    }
-    else {
-    /* To do: pmajety:
-          Remove the else condition when shrink_axis_mask is always defined. */
-        TF_RETURN_IF_ERROR(PrepareTensorForShape(
-                params->converter, TRT_TensorOrWeights(tensor), *final_shape,
-                /*validation_only=*/false, &tensor, node_def, op_instance));
->>>>>>> Negative values in begin/end tensors -- preliminary changes.
     }
   }
   params->outputs->push_back(TRT_TensorOrWeights(tensor));
@@ -371,12 +359,7 @@ Status HandleDynamicStridedSliceInput(
         dynamic_begin_indices.push_back(dynamic_idx);
       }
     }
-<<<<<<< refs/remotes/origin/master
     if (end_mask[dynamic_idx] && !shrink_axis_mask[dynamic_idx]) {
-=======
-    if (end_dims.d[dynamic_idx] > -1 && end_mask[dynamic_idx] && !shrink_axis_mask[dynamic_idx]) {
-      end_dims.d[dynamic_idx] = stride_dims.d[dynamic_idx] > 0 ? 0 : -1;
->>>>>>> Negative values in begin/end tensors -- preliminary changes.
       if (stride_dims.d[dynamic_idx] > 0) {
         dynamic_end_indices.push_back(dynamic_idx);
     }
@@ -411,7 +394,7 @@ Status HandleDynamicStridedSliceInput(
         builder->GetPartialShapeOf(input_tensor, negative_begin_indices,
                                    /*sub_one=*/true);
     TRT_ENSURE_PTR_OK(negIdx_shape_masked_tensor); // [2, 0, 0] 
-//    // inverse mask
+    // inverse mask
     std::vector<int> non_neg_begin;
     for(int idx = 0; idx < begin_dims.nbDims; idx++){
       if(neg_beg_set.find(idx) != neg_beg_set.end()){
@@ -425,9 +408,9 @@ Status HandleDynamicStridedSliceInput(
     StatusOr<nvinfer1::IConstantLayer*> nonNegIdx_begin_masked_tensor =
         builder->Constant(non_neg_begin);        //[0,2,0] 
     TRT_ENSURE_PTR_OK(nonNegIdx_begin_masked_tensor);
-//
-//    // Add back the original "begin" values for non negative dimensions
-//    // with inverse mask generated values. 
+
+    // Add back the original "begin" values for non negative dimensions
+    // with inverse mask generated values. 
     StatusOr<nvinfer1::IElementWiseLayer*> begin_intermediate
          = builder->Add((*negIdx_shape_masked_tensor)->getOutput(0),
                         (*nonNegIdx_begin_masked_tensor)->getOutput(0)); //[1,2,0]
