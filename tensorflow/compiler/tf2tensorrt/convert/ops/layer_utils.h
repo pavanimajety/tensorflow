@@ -152,10 +152,10 @@ class TRTNetworkBuilder {
   }
   
   // Add a casting operation to network using IdentityLayer
-  StatusOr<nvinfer1::IdentityLayer*> ChangeOutputType(
-    nvinfer1::ITensor* input, nvinfer1::DataType output_dt  ) noexcept{
+  StatusOr<nvinfer1::IIdentityLayer*> ChangeOutputType(
+    nvinfer1::ITensor* input, nvinfer1::DataType output_dt) noexcept{
       TRT_ENSURE(input);
-      nvinfer1::IdnetityLayer* output = network_->addIdentity(
+      nvinfer1::IIdentityLayer* output = network_->addIdentity(
         input);
       output->setOutputType(0, output_dt);
       return output;
