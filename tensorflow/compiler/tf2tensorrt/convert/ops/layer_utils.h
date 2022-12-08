@@ -156,7 +156,7 @@ class TRTNetworkBuilder {
     nvinfer1::ITensor* input, nvinfer1::DataType output_dt) noexcept{
       TRT_ENSURE(input);
       nvinfer1::IIdentityLayer* output = network_->addIdentity(
-        input);
+        *input);
       output->setOutputType(0, output_dt);
       return output;
     }
@@ -229,6 +229,18 @@ class TRTNetworkBuilder {
     TRT_ENSURE(layer);
     return layer;
   }
+
+  // Adds an elementwise operation boolean AND to the network.
+  StatusOr<nvinfer1::IElementWiseLayer*> And(nvinfer1::ITensor* lhs,
+                                             nvinfer1::ITensor* rhs) noexcept {
+    TRT_ENSURE(lhs);
+    TRT_ENSURE(rhs);
+    nvinfer1::IElementWiseLayer* layer = network_->addElementWise(
+        *lhs, *rhs, nvinfer1::ElementWiseOperation::kAND);
+    TRT_ENSURE(layer);
+    return layer;
+  }
+
 
   // Adds a sequence of elementwise multiplication operations to the network.
   // The returned layer's output contains the cumulative elementwise product of
