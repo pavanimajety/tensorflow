@@ -411,8 +411,48 @@ class TRTNetworkBuilder {
     TRT_ENSURE(layer);
     return layer;
   }
+ 
+  StatusOr<nvinfer1::ITensor*> ClampDims(
+      nvinfer1::ITensor* indices, nvinfer1::ITensor* llimit,
+      nvinfer1::ITensor* rlimit) {
+    TRT_ENSURE(indices);
+    TRT_ENSURE(llimit);
+    TRT_ENSURE(rlimit);
+    auto minClamp  = (*this->Max(indices, llimit))->getOutput(0);
+    auto clamped = this->Min(minClamp, rlimit);
+    TRT_ENSURE_PTR_OK(clamped);
+    return (*clamped)->getOutput(0);
+  }
 
-  // Creates a Gather operation on the shape of the input tensor. The output of
+
+  StatusOr<nvinfer1::ITensor*> ModifyDimsIfNegative(
+      nvinfer1::ITensor* inputTensor, const DimsAdapter& indices) {
+    TRT_ENSURE(inputTensor);
+   // Get the runtime shape of input;
+    StatusOr<nvinfer1::IShapeLayer*> shape_layer = this->Shape(inputTensor);
+    TRT_ENSURE_PTR_OK(shape_layer);
+    nvinfer1::Dims indices_ = indices.AsTrtDims();
+    nvinfer1::ITensor* runtime_shape = (*shape_layer)->getOutput(0);
+    
+    nvinfer1::Dims indices_ = indices.AsTrtDims();
+    
+    // Creates a Constant Layer/ TRT Tensor of rank 1 & d = nbDims
+
+    auto ConstShapeTensor = [this, &indices_](int constant) {
+     return (*(this->Constant(std::vector<int>(indices_.nbDims, constant))))->getOutput(0);
+    };  
+      
+    StatusOr<nvinfer1::IConstantLayer*> indices_const= this->Constant(
+       std::vector<int>(indices_.d, indices_.d + indices_.nbDims));
+    nvinfer1::ITensor* indicesT= (*indices_const)->getOutput(0);
+    TRT_ENSURE(indicesT);
+    auto signs = this->ClampDims(indicesT, ConstShapeTensor(-1), ConstShapeTensor(0));
+    auto mulOut = (*(this->Mul(*signs, runtime_shape)))->getOutput(0);
+    auto output = (*(this->Sub(indicesT, mulOut)))->getOutput(0);
+    TRT_ENSURE(output);
+    return output;
+  }  
+   // Creates a Gather operation on the shape of the input tensor. The output of
   // the gather operation is a 1D shape tensor where output[i] = (!sub_one ?
   // input_shape[i] : input_shape[i] -1) if i is in "indices", otherwise zero.
   StatusOr<nvinfer1::IGatherLayer*> GetPartialShapeOf(

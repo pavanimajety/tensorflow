@@ -72,11 +72,6 @@ Status ConvertStridedSliceHelper(
     size_dims.d[i] = (std::abs(end_dims->dim(i) - begin_dims->dim(i)) +
                       std::abs(stride_dims->dim(i)) - 1) /
                      std::abs(stride_dims->dim(i));
-    // When begin tensor has negative values, currently range can't be computed.
-    if (begin_dims->dim(i) < 0) {
-      return errors::Unimplemented(
-          "Negative values in begin weight tensor are unsupported");
-    }
     if (input_dims.dim_size(i) < 0) {
       // end_dims and begin_dims do not have valid information yet.
       dynamic_input_size_indices.push_back(i);
@@ -106,7 +101,7 @@ Status ConvertStridedSliceHelper(
   StatusOr<TRTNetworkBuilder> builder = TRTNetworkBuilder::Create(
       params->converter->network(), params->weight_store);
   TRT_ENSURE_OK(builder);
-
+  
   // Create the slice operation. For dynamic dims, the inputs of the operations
   // may be reassigned later.
   StatusOr<nvinfer1::ISliceLayer*> slice =
@@ -182,8 +177,9 @@ Status HandleDynamicStridedSliceInput(
   const auto shrink_axis_mask =
       std::bitset<32>(strided_slice_spec.shrink_axis_dense_mask);
   nvinfer1::Dims dims = input_tensor->getDimensions();
+  auto rank = dims.nbDims;
 
-  for (int idx = 0; idx < dims.nbDims; ++idx) {
+  for (int idx = 0; idx < rank; ++idx) {
     VLOG(3) << "begin_mask[" << idx << "]: " << begin_mask[idx];
     VLOG(3) << "end_mask[" << idx << "]: " << end_mask[idx];
     VLOG(3) << "shrink_mask[" << idx << "]: " << shrink_axis_mask[idx];
@@ -216,66 +212,98 @@ Status HandleDynamicStridedSliceInput(
   //     begin_dims[dynamic_idx] to zero.
   //   - If "end_mask[dynamic_idx]" is set, we need to adjust slice end to the
   //     dynamic size of dimension "dynamic_idx".
-  absl::InlinedVector<int64, 4> dynamic_begin_indices;
-  absl::InlinedVector<int64, 4> dynamic_end_indices;
+  // absl::InlinedVector<int64, 4> dynamic_begin_indices;
+  // absl::InlinedVector<int64, 4> dynamic_end_indices;
 
-  for (int i = 0; i < dynamic_input_size_indices.size(); i++) {
-    auto dynamic_idx = dynamic_input_size_indices[i];
-    if (begin_mask[dynamic_idx]) {
-      begin_dims.d[dynamic_idx] = 0;
-      if (stride_dims.d[dynamic_idx] < 0) {
-        dynamic_begin_indices.push_back(dynamic_idx);
-      }
-    }
-    if (end_mask[dynamic_idx] && !shrink_axis_mask[dynamic_idx]) {
-      end_dims.d[dynamic_idx] = stride_dims.d[dynamic_idx] > 0 ? 0 : -1;
-      if (stride_dims.d[dynamic_idx] > 0) {
-        dynamic_end_indices.push_back(dynamic_idx);
-      }
-    }
-  }
+  // for (int i = 0; i < dynamic_input_size_indices.size(); i++) {
+  //   auto dynamic_idx = dynamic_input_size_indices[i];
+  //   if (begin_mask[dynamic_idx]) {
+  //     begin_dims.d[dynamic_idx] = 0;
+  //     if (stride_dims.d[dynamic_idx] < 0) {
+  //       dynamic_begin_indices.push_back(dynamic_idx);
+  //     }
+  //   }
+  //   if (end_mask[dynamic_idx] && !shrink_axis_mask[dynamic_idx]) {
+  //     end_dims.d[dynamic_idx] = stride_dims.d[dynamic_idx] > 0 ? 0 : -1;
+  //     if (stride_dims.d[dynamic_idx] > 0) {
+  //       dynamic_end_indices.push_back(dynamic_idx);
+  //     }
+  //   }
+  // }
 
-  VLOG(2) << " Dynamic begin indices: " << DebugString(dynamic_begin_indices)
-          << " Dynamic end indices: " << DebugString(dynamic_end_indices);
+  // VLOG(2) << " Dynamic begin indices: " << DebugString(dynamic_begin_indices)
+  //         << " Dynamic end indices: " << DebugString(dynamic_end_indices);
+  // Correct begin_dims and end_dims if negative 
+  auto ConstLayer = [&builder, &rank](int constant) {
+     return (*(builder->Constant(std::vector<int>(rank, constant))))->getOutput(0);
+  }; 
 
-  // Create ITensors for each of the begin/stride/end constants.
-  StatusOr<nvinfer1::IConstantLayer*> begin_const = builder->Constant(
-      std::vector<int>(begin_dims.d, begin_dims.d + begin_dims.nbDims));
-  TRT_ENSURE_PTR_OK(begin_const);
-  nvinfer1::ITensor* begin_tensor = (*begin_const)->getOutput(0);
+  auto ConstLayerV = [&builder](std::vector<int> vec) {
+     return (*(builder->Constant(vec)))->getOutput(0);
+  };  
+
+  // Set strideSigns to step < 0 ? -1 : 0.
   StatusOr<nvinfer1::IConstantLayer*> stride_const = builder->Constant(
-      std::vector<int>(stride_dims.d, stride_dims.d + stride_dims.nbDims));
+      std::vector<int>(stride_dims.d, stride_dims.d + rank));
   TRT_ENSURE_PTR_OK(stride_const);
-  StatusOr<nvinfer1::IConstantLayer*> end_const = builder->Constant(
-      std::vector<int>(end_dims.d, end_dims.d + end_dims.nbDims));
-  TRT_ENSURE_PTR_OK(end_const);
-  nvinfer1::ITensor* end_tensor = (*end_const)->getOutput(0);
+  auto strideSigns = builder->ClampDims(
+         (*stride_const)->getOutput(0), ConstLayer(-1), ConstLayer(0));
+  auto runtime_input_shape= builder->Shape(input_tensor);
+  TRT_ENSURE_PTR_OK(runtime_input_shape);
+  auto begin_tensor = *(builder->ModifyDimsIfNegative(input_tensor, begin_dims));
+  auto b_rlimit_subl = builder->Add(
+               (*runtime_input_shape)->getOutput(0), *strideSigns);
+  auto b_rlimit = (*b_rlimit_subl)->getOutput(0);
+  begin_tensor = *(builder->ClampDims(begin_tensor, ConstLayer(0), b_rlimit));
+  
+  auto end_tensor = *(builder->ModifyDimsIfNegative(
+          input_tensor, end_dims));
+  auto e_rlimit = (*runtime_input_shape)->getOutput(0);
+  end_tensor =  *(builder->ClampDims(end_tensor, (*strideSigns), e_rlimit));
 
-  // Make corrections based on the begin_mask/end_mask values.
-  if (dynamic_end_indices.size() > 0) {
-    StatusOr<nvinfer1::IGatherLayer*> dynamic_end_masked_tensor =
-        builder->GetPartialShapeOf(input_tensor, dynamic_end_indices,
-                                   /*sub_one=*/false);
-    TRT_ENSURE_PTR_OK(dynamic_end_masked_tensor);
-    StatusOr<nvinfer1::IElementWiseLayer*> end_corrected =
-        builder->Add((*dynamic_end_masked_tensor)->getOutput(0), end_tensor);
-    TRT_ENSURE_PTR_OK(end_corrected);
-    end_tensor = (*end_corrected)->getOutput(0);
+  // Calcul  //include mask logic
+  // bitset, convert to vector
+  const auto bbegin_mask = std::bitset<32>(strided_slice_spec.begin_dense_mask);
+  const auto bend_mask = std::bitset<32>(strided_slice_spec.end_dense_mask);
+  const auto bshrink_axis_mask = std::bitset<32>(strided_slice_spec.shrink_axis_dense_mask);
+  // create a constant layer
+  std::vector<int> vbegin_mask(rank), vend_mask(rank), vshrink_axis_mask(rank);
+  std::vector<int> invbegin_mask(rank), invend_mask(rank), invshrink_axis_mask(rank);
+  for(int i = 0; i < rank; ++i) {
+    invbegin_mask[i] = static_cast<int>(!bbegin_mask[i]) ; //!begin_mask
+    invend_mask[i] = static_cast<int>(!bend_mask[i]) ; //!end_mask
+    invshrink_axis_mask[i] = static_cast<int>(!bshrink_axis_mask[i]) ; //!shrink_axis_mask
+    vbegin_mask[i] = static_cast<int>(bbegin_mask[i]); //begin_mask
+    vend_mask[i] = static_cast<int>(bend_mask[i]); //end_mask
+    vshrink_axis_mask[i] = static_cast<int>(bshrink_axis_mask[i]);//shrink_axis_mask
   }
-  if (dynamic_begin_indices.size() > 0) {
-    StatusOr<nvinfer1::IGatherLayer*> dynamic_begin_masked_tensor =
-        builder->GetPartialShapeOf(input_tensor, dynamic_begin_indices,
-                                   /*sub_one=*/true);
-    TRT_ENSURE_PTR_OK(dynamic_begin_masked_tensor);
+  
+  auto begin_mask_layer = ConstLayerV(vbegin_mask);
+  auto end_mask_layer = ConstLayerV(vend_mask);
+  auto shrink_axis_mask_layer = ConstLayerV(vshrink_axis_mask);
+  // multiply with runtime shape
+  // begin_mask
+  // begin_dims = 0 when mask is 1
+  // begin = !mask * begin
+  auto mod_begin = builder->Mul(ConstLayerV(invbegin_mask), begin_tensor);
+  begin_tensor = (*mod_begin)->getOutput(0);
+  auto mod_end_lhs = builder->Mul(ConstLayerV(vend_mask), (*runtime_input_shape)->getOutput(0));
+  auto mod_end_rhs = builder->Mul(ConstLayerV(invend_mask), end_tensor);
+  auto mod_end = builder->Add((*mod_end_lhs)->getOutput(0), (*mod_end_rhs)->getOutput(0));
+  end_tensor = (*mod_end)->getOutput(0);
+  //end = begin+1
+  auto samod_end_1 = builder->Add(ConstLayer(1), begin_tensor);
+  auto samod_end_l = builder->Mul(ConstLayerV(vshrink_axis_mask), (*samod_end_1)->getOutput(0));
+  auto samod_end_r = builder->Mul(ConstLayerV(invshrink_axis_mask), end_tensor);
+  auto samod_end = builder->Add((*samod_end_l)->getOutput(0), (*samod_end_r)->getOutput(0));
+  end_tensor = (*samod_end)->getOutput(0);
 
-    // Add back the original "begin" values for static dimensions.
-    StatusOr<nvinfer1::IElementWiseLayer*> begin_corrected = builder->Add(
-        (*dynamic_begin_masked_tensor)->getOutput(0), begin_tensor);
-    TRT_ENSURE_PTR_OK(begin_corrected);
-    begin_tensor = (*begin_corrected)->getOutput(0);
-  }
+  
+  
 
-  // Calculate the final size of the slice dynamicaly.
+  // end_mask
+
+  // shrink_axis_mask end = begin+1ate the final size of the slice dynamicaly.
   nvinfer1::ITensor* size_tensor;
   {
     StatusOr<nvinfer1::IElementWiseLayer*> num =
@@ -297,4 +325,5 @@ Status HandleDynamicStridedSliceInput(
 }  // namespace convert
 }  // namespace tensorrt
 }  // namespace tensorflow
+
 #endif  // GOOGLE_CUDA && GOOGLE_TENSORRT
