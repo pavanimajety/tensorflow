@@ -415,38 +415,42 @@ class TRTNetworkBuilder {
   StatusOr<nvinfer1::ITensor*> ClampDims(
       nvinfer1::ITensor* indices, nvinfer1::ITensor* llimit,
       nvinfer1::ITensor* rlimit) {
-    TRT_ENSURE(indices);
-    TRT_ENSURE(llimit);
-    TRT_ENSURE(rlimit);
     auto minClamp  = (*this->Max(indices, llimit))->getOutput(0);
     auto clamped = this->Min(minClamp, rlimit);
     TRT_ENSURE_PTR_OK(clamped);
     return (*clamped)->getOutput(0);
   }
 
-
   StatusOr<nvinfer1::ITensor*> ModifyDimsIfNegative(
-      nvinfer1::ITensor* inputTensor, const DimsAdapter& indices) {
+      nvinfer1::ITensor* inputTensor, nvinfer1::ITensor* indicesT, int rank ) {
     TRT_ENSURE(inputTensor);
    // Get the runtime shape of input;
     StatusOr<nvinfer1::IShapeLayer*> shape_layer = this->Shape(inputTensor);
     TRT_ENSURE_PTR_OK(shape_layer);
-    nvinfer1::Dims indices_ = indices.AsTrtDims();
     nvinfer1::ITensor* runtime_shape = (*shape_layer)->getOutput(0);
     
-    nvinfer1::Dims indices_ = indices.AsTrtDims();
-    
-    // Creates a Constant Layer/ TRT Tensor of rank 1 & d = nbDims
-
-    auto ConstShapeTensor = [this, &indices_](int constant) {
-     return (*(this->Constant(std::vector<int>(indices_.nbDims, constant))))->getOutput(0);
+    //nvinfer1::Dims indices_ = indices.AsTrtDims();
+    //VLOG(2) << "Dims in ModifyDimsIfNegative method: " << DebugString(indices_);
+    // Creates a Constant Layer/ TRT Tensor of rank 1 & d = nbDims 
+    auto ConstShapeTensor = [this](int nbDims, int constant) {
+         return (*(this->Constant(std::vector<int>(nbDims, constant))))->getOutput(0);
     };  
       
-    StatusOr<nvinfer1::IConstantLayer*> indices_const= this->Constant(
-       std::vector<int>(indices_.d, indices_.d + indices_.nbDims));
-    nvinfer1::ITensor* indicesT= (*indices_const)->getOutput(0);
-    TRT_ENSURE(indicesT);
-    auto signs = this->ClampDims(indicesT, ConstShapeTensor(-1), ConstShapeTensor(0));
+  //  StatusOr<nvinfer1::IConstantLayer*> indices_const= this->Constant(
+  //     std::vector<int>(indices_.d, indices_.d + indices_.nbDims));
+  //  TRT_ENSURE_PTR_OK(indices_const);
+  //  nvinfer1::ITensor* indicesT= (*indices_const)->getOutput(0);
+
+    auto llimit = ConstShapeTensor(rank,-1);
+    auto rlimit= ConstShapeTensor(rank, 0);
+    TRT_ENSURE(llimit);
+    TRT_ENSURE(rlimit);
+    TRT_ENSURE(indicesT) 
+
+    VLOG(2) << "llimit" << DebugString(llimit);
+    VLOG(2) << "rlimit" << DebugString(rlimit);
+    VLOG(2) << "indices tensor" << DebugString(indicesT);
+    auto signs = this->ClampDims(indicesT, llimit, rlimit);
     auto mulOut = (*(this->Mul(*signs, runtime_shape)))->getOutput(0);
     auto output = (*(this->Sub(indicesT, mulOut)))->getOutput(0);
     TRT_ENSURE(output);
@@ -752,4 +756,3 @@ class ShuffleBuilder {
 }  // namespace tensorflow
 
 #endif  // GOOGLE_CUDA && GOOGLE_TENSORRT
-#endif  // TENSORFLOW_COMPILER_TF2TENSORRT_CONVERT_OPS_LAYER_UTILS_H_
